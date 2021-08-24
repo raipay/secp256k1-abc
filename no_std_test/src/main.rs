@@ -12,11 +12,11 @@
 // If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
 //
 
-//! # secp256k1 no-std test.
+//! # secp256k1_abc no-std test.
 //! This binary is a short smallest rust code to produce a working binary *without libstd*.
 //! This gives us 2 things:
 //!     1. Test that the parts of the code that should work in a no-std enviroment actually work. Note that this is not a comprehensive list.
-//!     2. Test that we don't accidentally import libstd into `secp256k1`.
+//!     2. Test that we don't accidentally import libstd into `secp256k1_abc`.
 //!
 //! The first is tested using the following command `cargo run --release | grep -q "Verified Successfully"`.
 //! (Making sure that it successfully printed that. i.e. it didn't abort before that).
@@ -46,7 +46,7 @@
 #![feature(alloc_error_handler)]
 #![no_std]
 extern crate libc;
-extern crate secp256k1;
+extern crate secp256k1_abc;
 extern crate serde_cbor;
 
 #[cfg(feature = "alloc")]
@@ -65,11 +65,11 @@ use core::fmt::{self, write, Write};
 use core::intrinsics;
 use core::panic::PanicInfo;
 
-use secp256k1::ecdh::SharedSecret;
-use secp256k1::ffi::types::AlignedType;
-use secp256k1::rand::{self, RngCore};
-use secp256k1::serde::Serialize;
-use secp256k1::*;
+use secp256k1_abc::ecdh::SharedSecret;
+use secp256k1_abc::ffi::types::AlignedType;
+use secp256k1_abc::rand::{self, RngCore};
+use secp256k1_abc::serde::Serialize;
+use secp256k1_abc::*;
 
 use serde_cbor::de;
 use serde_cbor::ser::SliceWrite;
