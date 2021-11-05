@@ -7,7 +7,6 @@ use rand::thread_rng;
 #[cfg(any(test, feature = "rand"))]
 use rand::{CryptoRng, Rng};
 
-use super::Error::{InvalidPublicKey, InvalidSecretKey, InvalidSignature};
 use super::{from_hex, Error};
 use core::{fmt, ptr, str};
 use ffi::{self, CPtr};
@@ -65,7 +64,7 @@ impl fmt::Display for Signature {
 impl str::FromStr for Signature {
     type Err = Error;
     fn from_str(s: &str) -> Result<Signature, Error> {
-        let mut res = [0; constants::SCHNORRSIG_SIGNATURE_SIZE];
+        let mut res = [0u8; constants::SCHNORRSIG_SIGNATURE_SIZE];
         match from_hex(s, &mut res) {
             Ok(constants::SCHNORRSIG_SIGNATURE_SIZE) => {
                 Signature::from_slice(&res[0..constants::SCHNORRSIG_SIGNATURE_SIZE])
@@ -76,8 +75,9 @@ impl str::FromStr for Signature {
 }
 
 /// Opaque data structure that holds a keypair consisting of a secret and a public key.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
+#[derive(Clone)]
 pub struct KeyPair(ffi::KeyPair);
+impl_display_secret!(KeyPair);
 
 /// A Schnorr public key, used for verification of Schnorr signatures
 #[derive(Copy, Clone, PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
@@ -102,12 +102,12 @@ impl fmt::Display for PublicKey {
 impl str::FromStr for PublicKey {
     type Err = Error;
     fn from_str(s: &str) -> Result<PublicKey, Error> {
-        let mut res = [0; constants::SCHNORRSIG_PUBLIC_KEY_SIZE];
+        let mut res = [0u8; constants::SCHNORRSIG_PUBLIC_KEY_SIZE];
         match from_hex(s, &mut res) {
             Ok(constants::SCHNORRSIG_PUBLIC_KEY_SIZE) => {
                 PublicKey::from_slice(&res[0..constants::SCHNORRSIG_PUBLIC_KEY_SIZE])
             }
-            _ => Err(InvalidPublicKey),
+            _ => Err(Error::InvalidPublicKey),
         }
     }
 }
@@ -118,11 +118,11 @@ impl Signature {
     pub fn from_slice(data: &[u8]) -> Result<Signature, Error> {
         match data.len() {
             constants::SCHNORRSIG_SIGNATURE_SIZE => {
-                let mut ret = [0; constants::SCHNORRSIG_SIGNATURE_SIZE];
+                let mut ret = [0u8; constants::SCHNORRSIG_SIGNATURE_SIZE];
                 ret[..].copy_from_slice(data);
                 Ok(Signature(ret))
             }
-            _ => Err(InvalidSignature),
+            _ => Err(Error::InvalidSignature),
         }
     }
 }
@@ -142,9 +142,11 @@ impl KeyPair {
 
     /// Creates a Schnorr KeyPair directly from generic Secp256k1 secret key
     ///
-    /// Panics if internal representation of the provided [`SecretKey`] does not
-    /// holds correct secret key value obtained from Secp256k1 library
-    /// previously
+    /// # Panic
+    ///
+    /// Panics if internal representation of the provided [`SecretKey`] does not hold correct secret
+    /// key value obtained from Secp256k1 library previously, specifically when secret key value is
+    /// out-of-range (0 or in excess of the group order).
     #[inline]
     pub fn from_secret_key<C: Signing>(
         secp: &Secp256k1<C>,
@@ -160,14 +162,19 @@ impl KeyPair {
         }
     }
 
-    /// Creates a Schnorr KeyPair directly from a secret key slice
+    /// Creates a Schnorr KeyPair directly from a secret key slice.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidSecretKey`] if the provided data has an incorrect length, exceeds Secp256k1
+    /// field `p` value or the corresponding public key is not even.
     #[inline]
     pub fn from_seckey_slice<C: Signing>(
         secp: &Secp256k1<C>,
         data: &[u8],
     ) -> Result<KeyPair, Error> {
         if data.is_empty() || data.len() != constants::SECRET_KEY_SIZE {
-            return Err(InvalidSecretKey);
+            return Err(Error::InvalidSecretKey);
         }
 
         unsafe {
@@ -175,20 +182,24 @@ impl KeyPair {
             if ffi::secp256k1_keypair_create(secp.ctx, &mut kp, data.as_c_ptr()) == 1 {
                 Ok(KeyPair(kp))
             } else {
-                Err(InvalidSecretKey)
+                Err(Error::InvalidSecretKey)
             }
         }
     }
 
     /// Creates a Schnorr KeyPair directly from a secret key string
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidSecretKey`] if corresponding public key for the provided secret key is not even.
     #[inline]
     pub fn from_seckey_str<C: Signing>(secp: &Secp256k1<C>, s: &str) -> Result<KeyPair, Error> {
-        let mut res = [0; constants::SECRET_KEY_SIZE];
+        let mut res = [0u8; constants::SECRET_KEY_SIZE];
         match from_hex(s, &mut res) {
             Ok(constants::SECRET_KEY_SIZE) => {
                 KeyPair::from_seckey_slice(secp, &res[0..constants::SECRET_KEY_SIZE])
             }
-            _ => Err(InvalidPublicKey),
+            _ => Err(Error::InvalidPublicKey),
         }
     }
 
@@ -211,10 +222,21 @@ impl KeyPair {
         }
     }
 
-    /// Tweak a keypair by adding the given tweak to the secret key and updating the
-    /// public key accordingly.
-    /// Will return an error if the resulting key would be invalid or if
-    /// the tweak was not a 32-byte length slice.
+    /// Serialize the key pair as a secret key byte value
+    #[inline]
+    pub fn serialize_secret(&self) -> [u8; constants::SECRET_KEY_SIZE] {
+        *SecretKey::from_keypair(self).as_ref()
+    }
+
+    /// Tweak a keypair by adding the given tweak to the secret key and updating the public key
+    /// accordingly.
+    ///
+    /// Will return an error if the resulting key would be invalid or if the tweak was not a 32-byte
+    /// length slice.
+    ///
+    /// NB: Will not error if the tweaked public key has an odd value and can't be used for
+    ///     BIP 340-342 purposes.
+    // TODO: Add checked implementation
     #[inline]
     pub fn tweak_add_assign<C: Verification>(
         &mut self,
@@ -254,7 +276,7 @@ impl PublicKey {
         &mut self.0
     }
 
-    /// Creates a new Schnorr public key from a Schnorr key pair
+    /// Creates a new Schnorr public key from a Schnorr key pair.
     #[inline]
     pub fn from_keypair<C: Signing>(secp: &Secp256k1<C>, keypair: &KeyPair) -> PublicKey {
         let mut pk_parity = 0;
@@ -272,10 +294,15 @@ impl PublicKey {
     }
 
     /// Creates a Schnorr public key directly from a slice
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPublicKey`] if the length of the data slice is not 32 bytes or the
+    /// slice does not represent a valid Secp256k1 point x coordinate
     #[inline]
     pub fn from_slice(data: &[u8]) -> Result<PublicKey, Error> {
         if data.is_empty() || data.len() != constants::SCHNORRSIG_PUBLIC_KEY_SIZE {
-            return Err(InvalidPublicKey);
+            return Err(Error::InvalidPublicKey);
         }
 
         unsafe {
@@ -288,17 +315,15 @@ impl PublicKey {
             {
                 Ok(PublicKey(pk))
             } else {
-                Err(InvalidPublicKey)
+                Err(Error::InvalidPublicKey)
             }
         }
     }
 
     #[inline]
-    /// Serialize the key as a byte-encoded pair of values. In compressed form
-    /// the y-coordinate is represented by only a single bit, as x determines
-    /// it up to one bit.
+    /// Serialize the key as a byte-encoded x coordinate value (32 bytes).
     pub fn serialize(&self) -> [u8; constants::SCHNORRSIG_PUBLIC_KEY_SIZE] {
-        let mut ret = [0; constants::SCHNORRSIG_PUBLIC_KEY_SIZE];
+        let mut ret = [0u8; constants::SCHNORRSIG_PUBLIC_KEY_SIZE];
 
         unsafe {
             let err = ffi::secp256k1_xonly_pubkey_serialize(
@@ -450,35 +475,31 @@ impl<'de> ::serde::Deserialize<'de> for PublicKey {
     }
 }
 
-impl SecretKey {
-    /// Creates a new secret key using data from BIP-340 [`KeyPair`]
-    pub fn from_keypair<V: Verification>(secp: &Secp256k1<V>, keypair: &KeyPair) -> Self {
-        let mut sk = [0; constants::SECRET_KEY_SIZE];
-        unsafe {
-            let ret = ffi::secp256k1_keypair_sec(
-                secp.ctx,
-                sk.as_mut_c_ptr(),
-                keypair.as_ptr()
-            );
-            debug_assert_eq!(ret, 1);
-        }
-        SecretKey(sk)
+impl From<KeyPair> for SecretKey {
+    #[inline]
+    fn from(pair: KeyPair) -> Self {
+        SecretKey::from_keypair(&pair)
     }
 }
 
-impl ::key::PublicKey {
-    /// Creates a new compressed public key key using data from BIP-340 [`KeyPair`]
-    pub fn from_keypair<C: Signing>(secp: &Secp256k1<C>, keypair: &KeyPair) -> Self {
-        unsafe {
-            let mut pk = ffi::PublicKey::new();
-            let ret = ffi::secp256k1_keypair_pub(
-                secp.ctx,
-                &mut pk,
-                keypair.as_ptr()
-            );
-            debug_assert_eq!(ret, 1);
-            ::key::PublicKey(pk)
-        }
+impl<'a> From<&'a KeyPair> for SecretKey {
+    #[inline]
+    fn from(pair: &'a KeyPair) -> Self {
+        SecretKey::from_keypair(pair)
+    }
+}
+
+impl From<KeyPair> for ::key::PublicKey {
+    #[inline]
+    fn from(pair: KeyPair) -> Self {
+        ::key::PublicKey::from_keypair(&pair)
+    }
+}
+
+impl<'a> From<&'a KeyPair> for ::key::PublicKey {
+    #[inline]
+    fn from(pair: &'a KeyPair) -> Self {
+        ::key::PublicKey::from_keypair(pair)
     }
 }
 
@@ -610,7 +631,7 @@ mod tests {
 
     macro_rules! hex_32 {
         ($hex:expr) => {{
-            let mut result = [0; 32];
+            let mut result = [0u8; 32];
             from_hex($hex, &mut result).expect("valid hex string");
             result
         }};
@@ -623,7 +644,7 @@ mod tests {
 
         let mut rng = thread_rng();
         let (seckey, pubkey) = secp.generate_schnorrsig_keypair(&mut rng);
-        let mut msg = [0; 32];
+        let mut msg = [0u8; 32];
 
         for _ in 0..100 {
             rng.fill_bytes(&mut msg);
@@ -638,7 +659,7 @@ mod tests {
     #[test]
     fn test_schnorrsig_sign_with_aux_rand_verify() {
         test_schnorrsig_sign_helper(|secp, msg, seckey, rng| {
-            let mut aux_rand = [0; 32];
+            let mut aux_rand = [0u8; 32];
             rng.fill_bytes(&mut aux_rand);
             secp.schnorrsig_sign_with_aux_rand(msg, seckey, &aux_rand)
         })
@@ -728,9 +749,9 @@ mod tests {
         let secp = Secp256k1::new();
         let sk_str = "688C77BC2D5AAFF5491CF309D4753B732135470D05B7B2CD21ADD0744FE97BEF";
         let keypair = KeyPair::from_seckey_str(&secp, sk_str).unwrap();
-        let sk = SecretKey::from_keypair(&secp, &keypair);
+        let sk = SecretKey::from_keypair(&keypair);
         assert_eq!(SecretKey::from_str(sk_str).unwrap(), sk);
-        let pk = ::key::PublicKey::from_keypair(&secp, &keypair);
+        let pk = ::key::PublicKey::from_keypair(&keypair);
         assert_eq!(::key::PublicKey::from_secret_key(&secp, &sk), pk);
         let xpk = PublicKey::from_keypair(&secp, &keypair);
         assert_eq!(PublicKey::from(pk), xpk);
@@ -861,7 +882,7 @@ mod tests {
 
         let msg = Message::from_slice(&[1; 32]).unwrap();
         let keypair = KeyPair::from_seckey_slice(&s, &[2; 32]).unwrap();
-        let aux = [3; 32];
+        let aux = [3u8; 32];
         let sig = s
             .schnorrsig_sign_with_aux_rand(&msg, &keypair, &aux);
         static SIG_BYTES: [u8; constants::SCHNORRSIG_SIGNATURE_SIZE] = [

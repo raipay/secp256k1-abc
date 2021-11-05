@@ -40,7 +40,7 @@
 //! # #[cfg(all(feature="rand", feature="bitcoin_hashes"))] {
 //! use secp256k1_abc::rand::rngs::OsRng;
 //! use secp256k1_abc::{Secp256k1, Message};
-//! use secp256k1_abc::bitcoin_hashes::sha256;
+//! use secp256k1_abc::hashes::sha256;
 //!
 //! let secp = Secp256k1::new();
 //! let mut rng = OsRng::new().expect("OsRng");
@@ -126,7 +126,7 @@
 pub extern crate secp256k1_sys_abc;
 pub use secp256k1_sys_abc as ffi;
 
-#[cfg(feature = "bitcoin_hashes")] pub extern crate bitcoin_hashes;
+#[cfg(feature = "bitcoin_hashes")] pub extern crate bitcoin_hashes as hashes;
 #[cfg(all(test, feature = "unstable"))] extern crate test;
 #[cfg(any(test, feature = "rand"))] pub extern crate rand;
 #[cfg(any(test))] extern crate rand_core;
@@ -137,10 +137,11 @@ pub use secp256k1_sys_abc as ffi;
 #[cfg(all(test, target_arch = "wasm32"))] extern crate wasm_bindgen_test;
 #[cfg(feature = "alloc")] extern crate alloc;
 
-use core::{fmt, ptr, str};
 
 #[macro_use]
 mod macros;
+#[macro_use]
+mod secret;
 mod context;
 pub mod constants;
 pub mod ecdh;
@@ -157,14 +158,14 @@ pub use key::PublicKey;
 pub use context::*;
 use core::marker::PhantomData;
 use core::ops::Deref;
-use core::mem;
+use core::{mem, fmt, ptr, str};
 use ffi::{CPtr, types::AlignedType};
 
 #[cfg(feature = "global-context-less-secure")]
 pub use context::global::SECP256K1;
 
 #[cfg(feature = "bitcoin_hashes")]
-use bitcoin_hashes::Hash;
+use hashes::Hash;
 
 /// An ECDSA signature
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -196,7 +197,7 @@ fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 impl str::FromStr for Signature {
 type Err = Error;
 fn from_str(s: &str) -> Result<Signature, Error> {
-    let mut res = [0; 72];
+    let mut res = [0u8; 72];
     match from_hex(s, &mut res) {
         Ok(x) => Signature::from_der(&res[0..x]),
         _ => Err(Error::InvalidSignature),
@@ -213,21 +214,21 @@ pub trait ThirtyTwoByteHash {
 }
 
 #[cfg(feature = "bitcoin_hashes")]
-impl ThirtyTwoByteHash for bitcoin_hashes::sha256::Hash {
+impl ThirtyTwoByteHash for hashes::sha256::Hash {
     fn into_32(self) -> [u8; 32] {
         self.into_inner()
     }
 }
 
 #[cfg(feature = "bitcoin_hashes")]
-impl ThirtyTwoByteHash for bitcoin_hashes::sha256d::Hash {
+impl ThirtyTwoByteHash for hashes::sha256d::Hash {
     fn into_32(self) -> [u8; 32] {
         self.into_inner()
     }
 }
 
 #[cfg(feature = "bitcoin_hashes")]
-impl<T: bitcoin_hashes::sha256t::Tag> ThirtyTwoByteHash for bitcoin_hashes::sha256t::Hash<T> {
+impl<T: hashes::sha256t::Tag> ThirtyTwoByteHash for hashes::sha256t::Hash<T> {
     fn into_32(self) -> [u8; 32] {
         self.into_inner()
     }
@@ -398,7 +399,7 @@ impl Signature {
     #[inline]
     /// Serializes the signature in compact format
     pub fn serialize_compact(&self) -> [u8; 64] {
-        let mut ret = [0; 64];
+        let mut ret = [0u8; 64];
         unsafe {
             let err = ffi::secp256k1_ecdsa_signature_serialize_compact(
                 ffi::secp256k1_context_no_precomp,
@@ -474,7 +475,7 @@ impl Message {
     pub fn from_slice(data: &[u8]) -> Result<Message, Error> {
         match data.len() {
             constants::MESSAGE_SIZE => {
-                let mut ret = [0; constants::MESSAGE_SIZE];
+                let mut ret = [0u8; constants::MESSAGE_SIZE];
                 ret[..].copy_from_slice(data);
                 Ok(Message(ret))
             }
@@ -498,8 +499,8 @@ impl Message {
     /// assert_eq!(m1, m2);
     /// ```
     #[cfg(feature = "bitcoin_hashes")]
-    pub fn from_hashed_data<H: ThirtyTwoByteHash + bitcoin_hashes::Hash>(data: &[u8]) -> Self {
-        <H as bitcoin_hashes::Hash>::hash(data).into()
+    pub fn from_hashed_data<H: ThirtyTwoByteHash + hashes::Hash>(data: &[u8]) -> Self {
+        <H as hashes::Hash>::hash(data).into()
     }
 }
 
@@ -528,10 +529,10 @@ pub enum Error {
     InvalidRecoveryId,
     /// Invalid tweak for add_*_assign or mul_*_assign
     InvalidTweak,
-    /// `tweak_add_check` failed on an xonly public key
-    TweakCheckFailed,
     /// Didn't pass enough memory to context creation with preallocated memory
     NotEnoughMemory,
+    /// Bad set of public keys
+    InvalidPublicKeySum,
 }
 
 impl Error {
@@ -544,8 +545,8 @@ impl Error {
             Error::InvalidSecretKey => "secp: malformed or out-of-range secret key",
             Error::InvalidRecoveryId => "secp: bad recovery id",
             Error::InvalidTweak => "secp: bad tweak",
-            Error::TweakCheckFailed => "secp: xonly_pubkey_tewak_add_check failed",
             Error::NotEnoughMemory => "secp: not enough memory allocated",
+            Error::InvalidPublicKeySum => "secp: the sum of public keys was invalid or the input vector lengths was less than 1",
         }
     }
 }
@@ -648,7 +649,7 @@ impl<C: Context> Secp256k1<C> {
     /// compilation with "rand" feature.
     #[cfg(any(test, feature = "rand"))]
     pub fn randomize<R: Rng + ?Sized>(&mut self, rng: &mut R) {
-        let mut seed = [0; 32];
+        let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
         self.seeded_randomize(&seed);
     }
@@ -673,7 +674,7 @@ impl<C: Context> Secp256k1<C> {
 }
 
 fn der_length_check(sig: &ffi::Signature, max_len: usize) -> bool {
-    let mut ser_ret = [0; 72];
+    let mut ser_ret = [0u8; 72];
     let mut len: usize = ser_ret.len();
     unsafe {
         let err = ffi::secp256k1_ecdsa_signature_serialize_der(
@@ -688,7 +689,7 @@ fn der_length_check(sig: &ffi::Signature, max_len: usize) -> bool {
 }
 
 fn compact_sig_has_zero_first_bit(sig: &ffi::Signature) -> bool {
-    let mut compact = [0; 64];
+    let mut compact = [0u8; 64];
     unsafe {
         let err = ffi::secp256k1_ecdsa_signature_serialize_compact(
             ffi::secp256k1_context_no_precomp,
@@ -852,6 +853,28 @@ fn from_hex(hex: &str, target: &mut [u8]) -> Result<usize, ()> {
     Ok(idx / 2)
 }
 
+/// Utility function used to encode hex into a target u8 buffer. Returns
+/// a reference to the target buffer as an str. Returns an error if the target
+/// buffer isn't big enough.
+#[inline]
+fn to_hex<'a>(src: &[u8], target: &'a mut [u8]) -> Result<&'a str, ()> {
+    let hex_len = src.len() * 2;
+    if target.len() < hex_len {
+        return Err(());
+    }
+    const HEX_TABLE: [u8; 16] = *b"0123456789abcdef";
+
+    let mut i = 0;
+    for &b in src {
+        target[i] = HEX_TABLE[usize::from(b >> 4)];
+        target[i+1] = HEX_TABLE[usize::from(b & 0b00001111)];
+        i +=2 ;
+    }
+    let result = &target[..hex_len];
+    debug_assert!(str::from_utf8(result).is_ok());
+    return unsafe { Ok(str::from_utf8_unchecked(result)) };
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -860,7 +883,7 @@ mod tests {
     use std::marker::PhantomData;
 
     use key::{SecretKey, PublicKey};
-    use super::from_hex;
+    use super::{from_hex, to_hex};
     use super::constants;
     use super::{Secp256k1, Signature, Message};
     use super::Error::{InvalidMessage, IncorrectSignature, InvalidSignature};
@@ -1008,7 +1031,7 @@ mod tests {
         let mut s = Secp256k1::new();
         s.randomize(&mut thread_rng());
 
-        let mut msg = [0; 32];
+        let mut msg = [0u8; 32];
         for _ in 0..100 {
             thread_rng().fill_bytes(&mut msg);
             let msg = Message::from_slice(&msg).unwrap();
@@ -1094,7 +1117,7 @@ mod tests {
         let mut s = Secp256k1::new();
         s.randomize(&mut thread_rng());
 
-        let mut msg = [0; 32];
+        let mut msg = [0u8; 32];
         for _ in 0..100 {
             thread_rng().fill_bytes(&mut msg);
             let msg = Message::from_slice(&msg).unwrap();
@@ -1127,8 +1150,8 @@ mod tests {
 
         // Wild keys: 1, CURVE_ORDER - 1
         // Wild msgs: 1, CURVE_ORDER - 1
-        let mut wild_keys = [[0; 32]; 2];
-        let mut wild_msgs = [[0; 32]; 2];
+        let mut wild_keys = [[0u8; 32]; 2];
+        let mut wild_msgs = [[0u8; 32]; 2];
 
         wild_keys[0][0] = 1;
         wild_msgs[0][0] = 1;
@@ -1185,6 +1208,32 @@ mod tests {
                    Err(InvalidMessage));
         assert!(Message::from_slice(&[0; constants::MESSAGE_SIZE]).is_ok());
         assert!(Message::from_slice(&[1; constants::MESSAGE_SIZE]).is_ok());
+    }
+
+    #[test]
+    fn test_hex() {
+        let mut rng = thread_rng();
+        const AMOUNT: usize = 1024;
+        for i in 0..AMOUNT {
+            // 255 isn't a valid utf8 character.
+            let mut hex_buf = [255u8; AMOUNT*2];
+            let mut src_buf = [0u8; AMOUNT];
+            let mut result_buf = [0u8; AMOUNT];
+            let src = &mut src_buf[0..i];
+            rng.fill_bytes(src);
+
+            let hex = to_hex(src, &mut hex_buf).unwrap();
+            assert_eq!(from_hex(hex, &mut result_buf).unwrap(), i);
+            assert_eq!(src, &result_buf[..i]);
+        }
+
+
+        assert!(to_hex(&[1;2], &mut [0u8; 3]).is_err());
+        assert!(to_hex(&[1;2], &mut [0u8; 4]).is_ok());
+        assert!(from_hex("deadbeaf", &mut [0u8; 3]).is_err());
+        assert!(from_hex("deadbeaf", &mut [0u8; 4]).is_ok());
+        assert!(from_hex("a", &mut [0u8; 4]).is_err());
+        assert!(from_hex("ag", &mut [0u8; 4]).is_err());
     }
 
     #[test]
@@ -1287,25 +1336,25 @@ mod tests {
     #[cfg(feature = "bitcoin_hashes")]
     #[test]
     fn test_from_hash() {
-        use bitcoin_hashes;
-        use bitcoin_hashes::Hash;
+        use hashes;
+        use hashes::Hash;
 
         let test_bytes = "Hello world!".as_bytes();
 
-        let hash = bitcoin_hashes::sha256::Hash::hash(test_bytes);
+        let hash = hashes::sha256::Hash::hash(test_bytes);
         let msg = Message::from(hash);
         assert_eq!(msg.0, hash.into_inner());
         assert_eq!(
             msg,
-            Message::from_hashed_data::<bitcoin_hashes::sha256::Hash>(test_bytes)
+            Message::from_hashed_data::<hashes::sha256::Hash>(test_bytes)
         );
 
-        let hash = bitcoin_hashes::sha256d::Hash::hash(test_bytes);
+        let hash = hashes::sha256d::Hash::hash(test_bytes);
         let msg = Message::from(hash);
         assert_eq!(msg.0, hash.into_inner());
         assert_eq!(
             msg,
-            Message::from_hashed_data::<bitcoin_hashes::sha256d::Hash>(test_bytes)
+            Message::from_hashed_data::<hashes::sha256d::Hash>(test_bytes)
         );
     }
 }
