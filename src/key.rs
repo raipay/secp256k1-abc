@@ -20,36 +20,21 @@
 use core::{fmt, str};
 
 use super::{from_hex, Secp256k1};
-use super::Error::{self, InvalidPublicKey, InvalidSecretKey};
-use Signing;
+use super::Error::{self, InvalidPublicKey, InvalidPublicKeySum, InvalidSecretKey};
+use ::{Signing};
 use Verification;
 use constants;
 use ffi::{self, CPtr};
 
 /// Secret 256-bit key used as `x` in an ECDSA signature
-pub struct SecretKey(pub(crate) [u8; constants::SECRET_KEY_SIZE]);
+pub struct SecretKey([u8; constants::SECRET_KEY_SIZE]);
 impl_array_newtype!(SecretKey, u8, constants::SECRET_KEY_SIZE);
-impl_pretty_debug!(SecretKey);
-
-impl fmt::LowerHex for SecretKey {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for ch in &self.0[..] {
-            write!(f, "{:02x}", *ch)?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Display for SecretKey {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::LowerHex::fmt(self, f)
-    }
-}
+impl_display_secret!(SecretKey);
 
 impl str::FromStr for SecretKey {
     type Err = Error;
     fn from_str(s: &str) -> Result<SecretKey, Error> {
-        let mut res = [0; constants::SECRET_KEY_SIZE];
+        let mut res = [0u8; constants::SECRET_KEY_SIZE];
         match from_hex(s, &mut res) {
             Ok(constants::SECRET_KEY_SIZE) => SecretKey::from_slice(&res),
             _ => Err(Error::InvalidSecretKey)
@@ -66,7 +51,7 @@ pub const ONE_KEY: SecretKey = SecretKey([0, 0, 0, 0, 0, 0, 0, 0,
 /// A Secp256k1 public key, used for verification of signatures
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 #[repr(transparent)]
-pub struct PublicKey(pub(crate) ffi::PublicKey);
+pub struct PublicKey(ffi::PublicKey);
 
 impl fmt::LowerHex for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -87,7 +72,7 @@ impl fmt::Display for PublicKey {
 impl str::FromStr for PublicKey {
     type Err = Error;
     fn from_str(s: &str) -> Result<PublicKey, Error> {
-        let mut res = [0; constants::UNCOMPRESSED_PUBLIC_KEY_SIZE];
+        let mut res = [0u8; constants::UNCOMPRESSED_PUBLIC_KEY_SIZE];
         match from_hex(s, &mut res) {
             Ok(constants::PUBLIC_KEY_SIZE) => {
                 PublicKey::from_slice(
@@ -132,7 +117,7 @@ impl SecretKey {
     pub fn from_slice(data: &[u8])-> Result<SecretKey, Error> {
         match data.len() {
             constants::SECRET_KEY_SIZE => {
-                let mut ret = [0; constants::SECRET_KEY_SIZE];
+                let mut ret = [0u8; constants::SECRET_KEY_SIZE];
                 unsafe {
                     if ffi::secp256k1_ec_seckey_verify(
                         ffi::secp256k1_context_no_precomp,
@@ -147,6 +132,27 @@ impl SecretKey {
             }
             _ => Err(InvalidSecretKey)
         }
+    }
+
+    /// Creates a new secret key using data from BIP-340 [`::schnorrsig::KeyPair`]
+    #[inline]
+    pub fn from_keypair(keypair: &::schnorrsig::KeyPair) -> Self {
+        let mut sk = [0u8; constants::SECRET_KEY_SIZE];
+        unsafe {
+            let ret = ffi::secp256k1_keypair_sec(
+                ffi::secp256k1_context_no_precomp,
+                sk.as_mut_c_ptr(),
+                keypair.as_ptr()
+            );
+            debug_assert_eq!(ret, 1);
+        }
+        SecretKey(sk)
+    }
+
+    /// Serialize the secret key as byte value
+    #[inline]
+    pub fn serialize_secret(&self) -> [u8; constants::SECRET_KEY_SIZE] {
+        self.0
     }
 
     #[inline]
@@ -218,7 +224,8 @@ impl SecretKey {
 impl ::serde::Serialize for SecretKey {
     fn serialize<S: ::serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if s.is_human_readable() {
-            s.collect_str(self)
+            let mut buf = [0u8; 64];
+            s.serialize_str(::to_hex(&self.0, &mut buf).expect("fixed-size hex serialization"))
         } else {
             s.serialize_bytes(&self[..])
         }
@@ -290,12 +297,27 @@ impl PublicKey {
         }
     }
 
+    /// Creates a new compressed public key key using data from BIP-340 [`::schnorrsig::KeyPair`]
+    #[inline]
+    pub fn from_keypair(keypair: &::schnorrsig::KeyPair) -> Self {
+        unsafe {
+            let mut pk = ffi::PublicKey::new();
+            let ret = ffi::secp256k1_keypair_pub(
+                ffi::secp256k1_context_no_precomp,
+                &mut pk,
+                keypair.as_ptr()
+            );
+            debug_assert_eq!(ret, 1);
+            PublicKey(pk)
+        }
+    }
+
     #[inline]
     /// Serialize the key as a byte-encoded pair of values. In compressed form
     /// the y-coordinate is represented by only a single bit, as x determines
     /// it up to one bit.
     pub fn serialize(&self) -> [u8; constants::PUBLIC_KEY_SIZE] {
-        let mut ret = [0; constants::PUBLIC_KEY_SIZE];
+        let mut ret = [0u8; constants::PUBLIC_KEY_SIZE];
 
         unsafe {
             let mut ret_len = constants::PUBLIC_KEY_SIZE as usize;
@@ -314,7 +336,7 @@ impl PublicKey {
 
     /// Serialize the key as a byte-encoded pair of values, in uncompressed form
     pub fn serialize_uncompressed(&self) -> [u8; constants::UNCOMPRESSED_PUBLIC_KEY_SIZE] {
-        let mut ret = [0; constants::UNCOMPRESSED_PUBLIC_KEY_SIZE];
+        let mut ret = [0u8; constants::UNCOMPRESSED_PUBLIC_KEY_SIZE];
 
         unsafe {
             let mut ret_len = constants::UNCOMPRESSED_PUBLIC_KEY_SIZE as usize;
@@ -395,12 +417,16 @@ impl PublicKey {
 
     /// Adds the keys in the provided slice together, returning the sum. Returns
     /// an error if the result would be the point at infinity, i.e. we are adding
-    /// a point to its own negation
+    /// a point to its own negation, if the provided slice has no element in it,
+    /// or if the number of element it contains is greater than i32::MAX.
     pub fn combine_keys(keys: &[&PublicKey]) -> Result<PublicKey, Error> {
         use core::mem::transmute;
         use core::i32::MAX;
 
-        debug_assert!(keys.len() < MAX as usize);
+        if keys.is_empty() || keys.len() > MAX as usize {
+            return Err(InvalidPublicKeySum);
+        }
+
         unsafe {
             let mut ret = ffi::PublicKey::new();
             let ptrs : &[*const ffi::PublicKey] =
@@ -414,7 +440,7 @@ impl PublicKey {
             {
                 Ok(PublicKey(ret))
             } else {
-                Err(InvalidPublicKey)
+                Err(InvalidPublicKeySum)
             }
         }
     }
@@ -482,7 +508,7 @@ impl Ord for PublicKey {
 #[cfg(test)]
 mod test {
     use Secp256k1;
-    use from_hex;
+    use {from_hex, to_hex};
     use super::super::Error::{InvalidPublicKey, InvalidSecretKey};
     use super::{PublicKey, SecretKey};
     use super::super::constants;
@@ -676,7 +702,11 @@ mod test {
         let (sk, _) = s.generate_keypair(&mut DumbRng(0));
 
         assert_eq!(&format!("{:?}", sk),
-                   "SecretKey(0100000000000000020000000000000003000000000000000400000000000000)");
+                   "SecretKey(#d3e0c51a23169bb5)");
+
+        let mut buf = [0u8; constants::SECRET_KEY_SIZE * 2];
+        assert_eq!(to_hex(&sk[..], &mut buf).unwrap(),
+                   "0100000000000000020000000000000003000000000000000400000000000000");
     }
 
     #[test]
@@ -699,7 +729,7 @@ mod test {
         let pk = PublicKey::from_slice(&[0x02, 0x18, 0x84, 0x57, 0x81, 0xf6, 0x31, 0xc4, 0x8f, 0x1c, 0x97, 0x09, 0xe2, 0x30, 0x92, 0x06, 0x7d, 0x06, 0x83, 0x7f, 0x30, 0xaa, 0x0c, 0xd0, 0x54, 0x4a, 0xc8, 0x87, 0xfe, 0x91, 0xdd, 0xd1, 0x66]).expect("pk");
 
         assert_eq!(
-            sk.to_string(),
+            sk.display_secret().to_string(),
             "01010101010101010001020304050607ffff0000ffff00006363636363636363"
         );
         assert_eq!(
@@ -891,6 +921,11 @@ mod test {
         assert!(sum2.is_ok());
         assert_eq!(sum1, sum2);
         assert_eq!(sum1.unwrap(), exp_sum);
+    }
+
+    #[cfg_attr(not(fuzzing), test)]
+    fn pubkey_combine_keys_empty_slice() {
+        assert!(PublicKey::combine_keys(&[]).is_err());
     }
 
     #[test]
